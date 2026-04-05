@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 import re
 from dataclasses import dataclass, field
@@ -399,6 +400,237 @@ class NonProfitScraper:
             finally:
                 await context.close()
 
+    def _infer_sector_from_listing_url(self, listing_url: str) -> str | None:
+        lowered = listing_url.lower()
+        if any(token in lowered for token in ("animal", "wildlife", "pet")):
+            return "Animal Welfare"
+        if any(token in lowered for token in ("alzheim", "autism", "health", "medical", "mental")):
+            return "Healthcare"
+        if any(token in lowered for token in ("education", "scholar", "school", "learning")):
+            return "Education"
+        if any(token in lowered for token in ("climate", "environment", "conservation")):
+            return "Environment"
+        if any(token in lowered for token in ("hunger", "homeless", "relief", "humanitarian", "disaster")):
+            return "Humanitarian"
+        return None
+
+    async def _fetch_json_from_page(self, page: Page, url: str) -> dict | list | None:
+        try:
+            return await page.evaluate(
+                """
+                async (targetUrl) => {
+                    const response = await fetch(targetUrl, { credentials: 'include' });
+                    if (!response.ok) {
+                        return null;
+                    }
+                    return await response.json();
+                }
+                """,
+                url,
+            )
+        except Exception:
+            return None
+
+    async def _extract_orgs_from_charitynavigator_api(
+        self,
+        page: Page,
+        listing_url: str,
+    ) -> list[RawOrganizationData]:
+        post_json_url = await page.evaluate(
+            """
+            () => {
+                const alt = document.querySelector('link[rel="alternate"][type="application/json"]');
+                return alt ? alt.href : "";
+            }
+            """
+        )
+        if not post_json_url:
+            return []
+
+        post_data = await self._fetch_json_from_page(page, post_json_url)
+        if not isinstance(post_data, dict):
+            return []
+
+        rendered = str(post_data.get("content", {}).get("rendered", ""))
+        pre_match = re.search(r"<pre[^>]*>(\{.*?\})</pre>", rendered, re.DOTALL)
+        if not pre_match:
+            return []
+
+        try:
+            pre_payload = json.loads(pre_match.group(1))
+        except json.JSONDecodeError:
+            return []
+
+        list_id = str(pre_payload.get("listId", "")).strip()
+        if not list_id.isdigit():
+            return []
+
+        wtgn_url = f"https://www.charitynavigator.org/wp-json/cn-wtgn-api/v1/lists/{list_id}"
+        wtgn_data = await self._fetch_json_from_page(page, wtgn_url)
+        if not isinstance(wtgn_data, dict):
+            return []
+
+        groups = wtgn_data.get("groups", [])
+        if not isinstance(groups, list):
+            return []
+
+        nonprofits: list[dict] = []
+        for group in groups:
+            if isinstance(group, dict):
+                group_items = group.get("nonprofits", [])
+                if isinstance(group_items, list):
+                    nonprofits.extend(group_items)
+
+        if not nonprofits:
+            return []
+
+        sector_hint = self._infer_sector_from_listing_url(listing_url)
+        max_items = 25
+        extracted: list[RawOrganizationData] = []
+        seen: set[str] = set()
+
+        for entry in nonprofits[:max_items]:
+            if not isinstance(entry, dict):
+                continue
+
+            name = re.sub(r"\s+", " ", str(entry.get("name", "")).strip())
+            if not name or not self._is_plausible_org_name(name):
+                continue
+
+            key = re.sub(r"\W+", "", name.lower())
+            if not key or key in seen:
+                continue
+            seen.add(key)
+
+            ein = str(entry.get("ein", "")).strip()
+            cn_link = str(entry.get("cnLink", "")).strip()
+            if ein and not cn_link:
+                cn_link = f"https://www.charitynavigator.org/ein/{ein}"
+            elif cn_link.startswith("https:/") and not cn_link.startswith("https://"):
+                cn_link = cn_link.replace("https:/", "https://", 1)
+
+            score = entry.get("encompass_score_total_display")
+            stars = entry.get("encompass_star_rating")
+            city = str(entry.get("city", "")).strip()
+            state = str(entry.get("state", "")).strip()
+
+            tags = entry.get("tags", [])
+            size_label = ""
+            if isinstance(tags, list) and tags and isinstance(tags[0], dict):
+                size_label = str(tags[0].get("name", "")).strip()
+
+            mission = re.sub(r"\s+", " ", str(entry.get("nonprofit_response", "")).strip())
+            if not mission:
+                mission = f"{name} is included in a curated U.S. nonprofit list on Charity Navigator."
+
+            metadata_bits: list[str] = []
+            if city or state:
+                metadata_bits.append(f"Location: {city}{', ' if city and state else ''}{state}")
+            if size_label:
+                metadata_bits.append(f"Organization size: {size_label}")
+            if score is not None:
+                metadata_bits.append(f"Encompass score: {score}/100")
+            if stars is not None:
+                metadata_bits.append(f"Star rating: {stars}/4")
+            if ein:
+                metadata_bits.append(f"EIN: {ein}")
+
+            enriched_description = mission
+            if metadata_bits:
+                enriched_description = f"{mission} {'; '.join(metadata_bits)}."
+
+            extracted.append(
+                RawOrganizationData(
+                    name=name,
+                    website=cn_link or None,
+                    raw_description=enriched_description,
+                    source_url=listing_url,
+                    sector_hint=sector_hint,
+                    extra_metadata={
+                        "ein": ein,
+                        "cn_profile": cn_link,
+                        "city": city,
+                        "state": state,
+                        "size": size_label,
+                        "encompass_score": str(score) if score is not None else "",
+                        "encompass_stars": str(stars) if stars is not None else "",
+                    },
+                )
+            )
+
+        return extracted
+
+    async def _extract_orgs_from_listing_text(self, listing_url: str) -> list[RawOrganizationData]:
+        async with self._semaphore:
+            context = await self._create_stealth_context()
+            try:
+                page = await context.new_page()
+                await page.route("**/*", self._block_unnecessary_resources)
+                await page.goto(listing_url, wait_until="domcontentloaded", timeout=45_000)
+                await self._scroll_page(page)
+                await self._human_delay()
+
+                # Preferred path for Charity Navigator curated pages: pull structured data from WTGN API.
+                if "charitynavigator.org" in urlparse(listing_url).netloc.lower():
+                    api_items = await self._extract_orgs_from_charitynavigator_api(page, listing_url)
+                    if api_items:
+                        return api_items
+
+                body_text = await page.inner_text("body")
+                if not body_text:
+                    return []
+
+                text = re.sub(r"\s+", " ", body_text)
+                # Charity Navigator curated lists include mission snippets in this format:
+                # "100% Organization Name mission sentence. Donate"
+                pattern = re.compile(
+                    r"\b(?:100|99|98|97|96|95)%\s+([A-Z][A-Za-z0-9&'().,\- ]{3,90}?)\s+([a-z][^.]{35,320}\.)",
+                )
+
+                extracted: list[RawOrganizationData] = []
+                seen: set[str] = set()
+                sector_hint = self._infer_sector_from_listing_url(listing_url)
+
+                for match in pattern.finditer(text):
+                    name = re.sub(r"\s+", " ", match.group(1)).strip(" -,")
+                    mission = re.sub(r"\s+", " ", match.group(2)).strip()
+
+                    lowered_name = name.lower()
+                    if lowered_name.startswith((
+                        "donate",
+                        "favorite",
+                        "support our work",
+                        "learn how",
+                        "list of",
+                    )):
+                        continue
+
+                    if "charity navigator" in lowered_name:
+                        continue
+                    if not self._is_plausible_org_name(name):
+                        continue
+
+                    key = re.sub(r"\W+", "", name.lower())
+                    if not key or key in seen:
+                        continue
+                    seen.add(key)
+
+                    extracted.append(
+                        RawOrganizationData(
+                            name=name,
+                            website=None,
+                            raw_description=mission,
+                            source_url=listing_url,
+                            sector_hint=sector_hint,
+                        )
+                    )
+
+                return extracted
+            except Exception:
+                return []
+            finally:
+                await context.close()
+
     def _build_page_urls(self) -> list[str]:
         urls: list[str] = []
         for page_num in range(1, self._max_pages + 1):
@@ -430,6 +662,20 @@ class NonProfitScraper:
             if key and key not in seen:
                 seen.add(key)
                 cleaned.append(result)
+
+        if not cleaned:
+            listing_fallback_tasks = [self._extract_orgs_from_listing_text(url) for url in urls]
+            listing_fallback_results = await asyncio.gather(*listing_fallback_tasks, return_exceptions=True)
+
+            for fallback_result in listing_fallback_results:
+                if isinstance(fallback_result, Exception):
+                    continue
+                for item in fallback_result:
+                    key = re.sub(r"\W+", "", item.name.lower())
+                    if key and key not in seen:
+                        seen.add(key)
+                        cleaned.append(item)
+
         return cleaned
 
     async def scrape(self) -> AsyncGenerator[RawOrganizationData, None]:
