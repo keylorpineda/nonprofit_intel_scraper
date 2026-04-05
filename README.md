@@ -197,6 +197,7 @@ Traditional keyword-matching scorers are brittle: they break when descriptions c
 ### Mermaid Diagram (TD)
 
 ```mermaid
+%%{init: {'flowchart': {'curve': 'basis', 'nodeSpacing': 45, 'rankSpacing': 55, 'htmlLabels': true}} }%%
 graph TD
   A[Target Selection<br/>Charity Navigator URLs<br/>NGO Advisor URLs]
 
@@ -220,15 +221,17 @@ graph TD
     F4[Financial Tier Classification]
   end
 
-  G[Prioritization Engine<br/>Heuristic Scoring<br/>AI Score + Financial Tier]
+  P0[Score Fusion<br/>AI + Financial Signals]
+  G[Prioritization Engine<br/>Heuristic Scoring]
   H1[Output Layer<br/>Validated JSON via Pydantic]
   H2[(PostgreSQL Persistence)]
 
   A --> B1 --> B2 --> B3 --> D1
   D1 --> D2 --> D3 --> D4
   D3 --> F1 --> F2 --> F3 --> F4
-  D4 --> G
-  F4 --> G
+  D4 --> P0
+  F4 --> P0
+  P0 --> G
   G --> H1 --> H2
 
   classDef source fill:#EAF2FF,stroke:#1D4ED8,color:#0B1F44,stroke-width:1.5px;
@@ -243,7 +246,7 @@ graph TD
   class B1,B2,B3 collection;
   class D1,D2,D3,D4 intelligence;
   class F1,F2,F3,F4 enrichment;
-  class G prioritize;
+  class P0,G prioritize;
   class H1 output;
   class H2 storage;
 ```
