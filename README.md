@@ -33,6 +33,7 @@ A raw directory listing tells you an NGO exists. This pipeline tells you **it's 
 | **Runtime** | Python 3.11+ | Core language, async event loop |
 | **Browser Automation** | Playwright (Async API) | Stealth, JS-rendered page scraping |
 | **AI Engine** | Google Gemini 1.5 Flash | Text parsing, scoring, outreach reasoning |
+| **Financial Enrichment** | ProPublica Nonprofit Explorer (IRS 990) | Revenue/assets enrichment by EIN |
 | **Data Validation** | Pydantic v2 | Schema enforcement, type coercion |
 | **Persistence (Optional)** | PostgreSQL + asyncpg | Structured lead storage |
 | **Output** | JSON (structured) | Pipeline-agnostic data export |
@@ -80,6 +81,9 @@ Open `.env` and configure:
 | `SCRAPER_MAX_PAGES` | No | Number of directory pages to scrape (default: `3`) |
 | `SCRAPER_CONCURRENCY` | No | Max parallel browser contexts (default: `4`) |
 | `MIN_LEAD_SCORE` | No | Minimum AI score to include in output (default: `4`) |
+| `ENRICH_WITH_IRS990` | No | Enable/disable IRS 990 enrichment stage (`1`/`0`, default: `1`) |
+| `ENRICH_CONCURRENCY` | No | Parallel enrichment requests for IRS 990 lookups (default: `8`) |
+| `PRIORITY_TARGET_SECTORS` | No | Comma-separated sectors that receive prioritization bonus |
 | `OUTPUT_DIR` | No | Directory for JSON exports (default: `output/`) |
 | `POSTGRES_DSN` | No | PostgreSQL connection string for DB export |
 | `CUSTOM_TARGET_URLS` | No | Comma-separated list of specific NGO page URLs to target |
@@ -95,8 +99,10 @@ The pipeline will:
 2. Scrape NGO directory pages concurrently
 3. Pass raw data through the Gemini AI engine
 4. Validate and score each lead
-5. Export results to `output/qualified_leads_<timestamp>.json`
-6. Print a formatted terminal summary of top leads
+5. Enrich leads with IRS 990 financials (when EIN is available)
+6. Compute commercial prioritization score + budget tier
+7. Export results to `output/qualified_leads_<timestamp>.json`
+8. Print a formatted terminal summary of prioritized leads
 
 ### 4. Custom URL Targeting
 
@@ -121,15 +127,35 @@ Each entry in the `qualified_leads` array follows this schema:
   "lead_score": 9,
   "outreach_trigger": "MSF operates across 70+ countries with complex logistics data flows; recent expansion into digital health records creates an immediate opportunity to propose data integration and analytics solutions.",
   "source_url": "https://www.ngoadvisor.net/ong/msf/",
-  "website": "https://www.msf.org"
+  "website": "https://www.msf.org",
+  "ein": "123456789",
+  "annual_revenue_usd": 72873511,
+  "total_assets_usd": 132990857,
+  "financial_year": 2023,
+  "financial_data_source": "IRS 990 (ProPublica Nonprofit Explorer)",
+  "financial_summary": "Annual revenue: $72,873,511; Total assets: $132,990,857; IRS tax year: 2023; Source: IRS 990 (ProPublica Nonprofit Explorer)",
+  "budget_tier": "Enterprise",
+  "prioritization_score": 13.3
 }
 ```
+
+### Prioritization Logic
+
+Leads are sorted by a commercial `prioritization_score` that combines:
+
+- AI `lead_score` (1-10)
+- Revenue tier bonus (from IRS 990)
+- Asset strength bonus (from IRS 990)
+- Target sector fit bonus (`PRIORITY_TARGET_SECTORS`)
+- Presence of verified financial summary
+
+This means the final top leads are ordered for outreach impact, not only by generic AI score.
 
 ---
 
 ## Lead Scoring Algorithm
 
-The `lead_score` field (integer, 1–10) is computed by Gemini 2.0 Flash using a **multi-criteria heuristic scoring model**. The model is instructed to evaluate six independent sub-dimensions and sum their scores, capped at 10.
+The `lead_score` field (integer, 1–10) is computed by Gemini 1.5 Flash using a **multi-criteria heuristic scoring model**. The model is instructed to evaluate six independent sub-dimensions and sum their scores, capped at 10.
 
 ### Scoring Formula
 
@@ -158,7 +184,7 @@ Where each $s_i$ is a sub-score from the following rubric:
 
 ### Why Heuristic AI Scoring Over Rule-Based Scoring
 
-Traditional keyword-matching scorers are brittle: they break when descriptions change phrasing and have no semantic understanding. By delegating scoring to Gemini 2.0 Flash with a structured rubric prompt, the system gains:
+Traditional keyword-matching scorers are brittle: they break when descriptions change phrasing and have no semantic understanding. By delegating scoring to Gemini 1.5 Flash with a structured rubric prompt, the system gains:
 
 - **Semantic comprehension**: "provides clean water to underserved villages" → scores high on Humanitarian sector even without exact keyword matches.
 - **Context-awareness**: The model can infer organizational scale from indirect signals (e.g., "200 field offices" implies scale without the word "large").
@@ -181,9 +207,16 @@ main.py (Orchestrator)
     ├── processor.py (Intelligence Layer)
     │       LeadQualifyingEngine
     │       ├── Prompt construction with structured rubric injection
-    │       ├── Gemini 2.0 Flash API call (asyncio.to_thread)
+    │       ├── Gemini 1.5 Flash API call (asyncio.to_thread)
     │       ├── Retry logic with exponential backoff
     │       └── Pydantic QualifiedLead validation + coercion
+    │
+    ├── Financial Enrichment Layer
+    │       ├── EIN extraction from lead source/website
+    │       ├── ProPublica Nonprofit Explorer lookup
+    │       ├── Revenue/assets/year normalization
+    │       ├── Budget tier assignment
+    │       └── Prioritization score computation
     │
     └── output/ (Export Layer)
             ├── JSON export with run metadata + lead array
