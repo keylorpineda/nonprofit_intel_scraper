@@ -194,34 +194,65 @@ Traditional keyword-matching scorers are brittle: they break when descriptions c
 
 ## Architecture Overview
 
+### Mermaid Diagram (TD)
+
+```mermaid
+graph TD
+  A[Target Selection<br/>Charity Navigator URLs<br/>NGO Advisor URLs]
+
+  subgraph C[Collection Layer]
+    B1[Playwright Async Crawler]
+    B2[User-Agent Rotation]
+    B3[Semaphore Concurrency Control]
+  end
+
+  subgraph I[Intelligence Layer]
+    D1[Gemini 1.5 Flash]
+    D2[Raw HTML Parsing]
+    D3[Structured Intelligence<br/>Mission and Sector]
+    D4[AI Relevance Score]
+  end
+
+  subgraph E[Financial Enrichment Layer]
+    F1[EIN Extraction]
+    F2[ProPublica and IRS 990 API Lookup]
+    F3[Revenue and Assets Enrichment]
+    F4[Financial Tier Classification]
+  end
+
+  G[Prioritization Engine<br/>Heuristic Scoring<br/>AI Score + Financial Tier]
+  H1[Output Layer<br/>Validated JSON via Pydantic]
+  H2[(PostgreSQL Persistence)]
+
+  A --> B1 --> B2 --> B3 --> D1
+  D1 --> D2 --> D3 --> D4
+  D3 --> F1 --> F2 --> F3 --> F4
+  D4 --> G
+  F4 --> G
+  G --> H1 --> H2
+
+  classDef source fill:#EAF2FF,stroke:#1D4ED8,color:#0B1F44,stroke-width:1.5px;
+  classDef collection fill:#E6FFFA,stroke:#0F766E,color:#083344,stroke-width:1.5px;
+  classDef intelligence fill:#FFF7E6,stroke:#B45309,color:#7C2D12,stroke-width:1.5px;
+  classDef enrichment fill:#ECFDF3,stroke:#15803D,color:#14532D,stroke-width:1.5px;
+  classDef prioritize fill:#F5F3FF,stroke:#6D28D9,color:#3B0764,stroke-width:1.5px;
+  classDef output fill:#EFF6FF,stroke:#1E40AF,color:#1E3A8A,stroke-width:1.5px;
+  classDef storage fill:#F3F4F6,stroke:#374151,color:#111827,stroke-width:1.5px;
+
+  class A source;
+  class B1,B2,B3 collection;
+  class D1,D2,D3,D4 intelligence;
+  class F1,F2,F3,F4 enrichment;
+  class G prioritize;
+  class H1 output;
+  class H2 storage;
 ```
-main.py (Orchestrator)
-    │
-    ├── scraper.py (Data Collection Layer)
-    │       NonProfitScraper
-    │       ├── Stealth context creation (random UA, viewport, headers)
-    │       ├── Async page scraping with Semaphore concurrency control
-    │       ├── DOM extraction with multi-selector fallback chains
-    │       └── Deduplication via normalized name set
-    │
-    ├── processor.py (Intelligence Layer)
-    │       LeadQualifyingEngine
-    │       ├── Prompt construction with structured rubric injection
-    │       ├── Gemini 1.5 Flash API call (asyncio.to_thread)
-    │       ├── Retry logic with exponential backoff
-    │       └── Pydantic QualifiedLead validation + coercion
-    │
-    ├── Financial Enrichment Layer
-    │       ├── EIN extraction from lead source/website
-    │       ├── ProPublica Nonprofit Explorer lookup
-    │       ├── Revenue/assets/year normalization
-    │       ├── Budget tier assignment
-    │       └── Prioritization score computation
-    │
-    └── output/ (Export Layer)
-            ├── JSON export with run metadata + lead array
-            └── PostgreSQL upsert (optional, via asyncpg)
-```
+
+- `main.py`: Async orchestrator and pipeline entrypoint.
+- `scraper.py`: Stealth collection engine (Playwright async, user-agent rotation, semaphore control, deduplication).
+- `processor.py`: AI intelligence layer (Gemini parsing, scoring, validation, retries).
+- Financial enrichment stage: EIN extraction, IRS 990 lookup, revenue/assets normalization, budget tier assignment.
+- Export stage: Pydantic-validated JSON output and optional PostgreSQL upsert.
 
 ---
 
