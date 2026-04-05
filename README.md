@@ -197,24 +197,30 @@ Traditional keyword-matching scorers are brittle: they break when descriptions c
 ### Mermaid Diagram (TD)
 
 ```mermaid
-%%{init: {'flowchart': {'curve': 'basis', 'nodeSpacing': 45, 'rankSpacing': 55, 'htmlLabels': true}} }%%
+%%{init: {'flowchart': {'curve': 'basis', 'nodeSpacing': 45, 'rankSpacing': 80, 'htmlLabels': true}} }%%
 graph TD
   A[Target Selection<br/>Charity Navigator URLs<br/>NGO Advisor URLs]
 
-  subgraph C[Collection Layer]
+  subgraph C["Collection Layer "]
     B1[Playwright Async Crawler]
     B2[User-Agent Rotation]
     B3[Semaphore Concurrency Control]
   end
 
-  subgraph I[Intelligence Layer]
+  CollectionOut[ ]
+  CollectionOut:::hidden
+
+  subgraph I["Intelligence Layer "]
     D1[Gemini 1.5 Flash]
     D2[Raw HTML Parsing]
     D3[Structured Intelligence<br/>Mission and Sector]
     D4[AI Relevance Score]
   end
 
-  subgraph E[Financial Enrichment Layer]
+  IntelligenceOut[ ]
+  IntelligenceOut:::hidden
+
+  subgraph E["Financial Enrichment Layer "]
     F1[EIN Extraction]
     F2[ProPublica and IRS 990 API Lookup]
     F3[Revenue and Assets Enrichment]
@@ -226,11 +232,14 @@ graph TD
   H1[Output Layer<br/>Validated JSON via Pydantic]
   H2[(PostgreSQL Persistence)]
 
-  A --> B1 --> B2 --> B3 --> D1
+  A --> B1 --> B2 --> B3
+  B3 --> CollectionOut
+  CollectionOut --> D1
   D1 --> D2 --> D3 --> D4
-  D3 --> F1 --> F2 --> F3 --> F4
-  D4 --> P0
+  D4 --> IntelligenceOut
+  IntelligenceOut --> F1 --> F2 --> F3 --> F4
   F4 --> P0
+  D4 --> P0
   P0 --> G
   G --> H1 --> H2
 
@@ -241,6 +250,7 @@ graph TD
   classDef prioritize fill:#F5F3FF,stroke:#6D28D9,color:#3B0764,stroke-width:1.5px;
   classDef output fill:#EFF6FF,stroke:#1E40AF,color:#1E3A8A,stroke-width:1.5px;
   classDef storage fill:#F3F4F6,stroke:#374151,color:#111827,stroke-width:1.5px;
+  classDef hidden display:none;
 
   class A source;
   class B1,B2,B3 collection;
@@ -248,6 +258,8 @@ graph TD
   class F1,F2,F3,F4 enrichment;
   class P0,G prioritize;
   class H1 output;
+  class CollectionOut,IntelligenceOut hidden;
+```
   class H2 storage;
 ```
 
