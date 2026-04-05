@@ -15,6 +15,58 @@ from scraper import RawOrganizationData
 
 GEMINI_MODEL: str = "gemini-1.5-flash"
 
+SECTOR_ALIASES: dict[str, str] = {
+    "healthcare": "Healthcare",
+    "health": "Healthcare",
+    "medical": "Healthcare",
+    "education": "Education",
+    "school": "Education",
+    "learning": "Education",
+    "environment": "Environment",
+    "environmental": "Environment",
+    "climate": "Environment",
+    "sustainability": "Environment",
+    "humanitarian": "Humanitarian",
+    "relief": "Humanitarian",
+    "refugee": "Humanitarian",
+    "technology": "Technology",
+    "digital": "Technology",
+    "rights": "Human Rights",
+    "justice": "Human Rights",
+    "animal": "Animal Welfare",
+    "wildlife": "Animal Welfare",
+    "rescue": "Animal Welfare",
+    "art": "Arts & Culture",
+    "culture": "Arts & Culture",
+    "economic": "Economic Development",
+    "livelihood": "Economic Development",
+}
+
+SECTOR_KEYWORDS_PRIORITY: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Animal Welfare", ("animal", "wildlife", "rescue", "rehabilitation", "sanctuary", "pet")),
+    ("Healthcare", ("healthcare", "health", "medical", "clinic", "patient", "mental", "alzheim", "autism")),
+    ("Humanitarian", ("humanitarian", "relief", "refugee", "disaster", "hunger", "homeless")),
+    ("Environment", ("environment", "environmental", "climate", "sustainability", "conservation")),
+    ("Education", ("education", "school", "learning", "scholar", "training", "awareness")),
+    ("Technology", ("technology", "digital", "automation", "data", "software")),
+    ("Human Rights", ("rights", "justice", "civil", "equity")),
+    ("Economic Development", ("economic", "livelihood", "employment", "entrepreneur")),
+    ("Arts & Culture", ("art", "culture", "museum", "heritage", "music")),
+)
+
+ALLOWED_SECTORS: set[str] = {
+    "Healthcare",
+    "Education",
+    "Environment",
+    "Humanitarian",
+    "Technology",
+    "Arts & Culture",
+    "Economic Development",
+    "Human Rights",
+    "Animal Welfare",
+    "Other",
+}
+
 QUALIFICATION_PROMPT_TEMPLATE: str = """
 You are an expert NGO analyst and B2B sales intelligence specialist.
 Analyze the following raw data extracted from a non-profit directory and return a
@@ -32,8 +84,8 @@ Raw Description / HTML Text:
 Return EXACTLY this JSON structure with no additional keys:
 {{
   "organization_name": "<cleaned, professional name>",
-  "mission_statement": "<concise 1-2 sentence mission summary>",
-  "target_sector": "<single sector: Healthcare | Education | Environment | Humanitarian | Technology | Arts & Culture | Economic Development | Human Rights | Animal Welfare | Other>",
+    "mission_statement": "<direct 1-2 sentence mission summary>",
+    "target_sector": "<single sector: Healthcare | Education | Environment | Environmental | Humanitarian | Technology | Arts & Culture | Economic Development | Human Rights | Animal Welfare | Other>",
   "lead_score": <integer 1-10 based on the scoring rubric below>,
   "outreach_trigger": "<specific, actionable reason for a sales team to contact them NOW>"
 }}
@@ -48,7 +100,9 @@ LEAD SCORING RUBRIC (sum sub-scores, cap at 10):
 
 IMPORTANT:
 - lead_score MUST be an integer between 1 and 10.
-- outreach_trigger must be specific, not generic. Reference actual mission details.
+- target_sector is REQUIRED and must be exactly one value from the allowed sector list above. Use Other only as a last resort.
+- mission_statement must directly summarize the mission; do not start with phrases like "appears in public listings" or "according to available information".
+- outreach_trigger must be specific, not generic. Include at least one concrete signal from the raw text (program focus, population served, channels used, campaign/activity, or partnerships). Never use template language.
 - If data is insufficient, still produce best-effort output. Never return null for required fields.
 """
 
@@ -61,18 +115,20 @@ class QualifiedLead(BaseModel):
     outreach_trigger: str = Field(..., min_length=20, max_length=800)
     source_url: str = Field(default="")
     website: str | None = Field(default=None)
+    ein: str | None = Field(default=None)
+    annual_revenue_usd: int | None = Field(default=None)
+    total_assets_usd: int | None = Field(default=None)
+    financial_year: int | None = Field(default=None)
+    financial_data_source: str | None = Field(default=None)
+    financial_summary: str | None = Field(default=None)
+    budget_tier: str | None = Field(default=None)
+    prioritization_score: float | None = Field(default=None)
 
     @field_validator("target_sector")
     @classmethod
     def validate_sector(cls, v: str) -> str:
-        valid_sectors = {
-            "Healthcare", "Education", "Environment", "Humanitarian",
-            "Technology", "Arts & Culture", "Economic Development",
-            "Human Rights", "Animal Welfare", "Other",
-        }
-        if v not in valid_sectors:
-            return "Other"
-        return v
+        normalized = LeadQualifyingEngine.normalize_sector(v)
+        return normalized if normalized in ALLOWED_SECTORS else "Other"
 
     @field_validator("lead_score", mode="before")
     @classmethod
@@ -107,6 +163,139 @@ class LeadQualifyingEngine:
             max_output_tokens=1024,
             response_mime_type="application/json",
         )
+
+    @staticmethod
+    def normalize_sector(value: str | None) -> str:
+        if not value:
+            return "Other"
+
+        cleaned = re.sub(r"\s+", " ", str(value)).strip()
+        if not cleaned:
+            return "Other"
+
+        canonical = {
+            "Healthcare": "Healthcare",
+            "Education": "Education",
+            "Environment": "Environment",
+            "Environmental": "Environment",
+            "Humanitarian": "Humanitarian",
+            "Technology": "Technology",
+            "Arts & Culture": "Arts & Culture",
+            "Economic Development": "Economic Development",
+            "Human Rights": "Human Rights",
+            "Animal Welfare": "Animal Welfare",
+            "Other": "Other",
+        }
+        if cleaned in canonical:
+            return canonical[cleaned]
+
+        lowered = cleaned.lower()
+        inferred = LeadQualifyingEngine._infer_sector_from_text(lowered)
+        if inferred != "Other":
+            return inferred
+
+        for alias, normalized in SECTOR_ALIASES.items():
+            if alias in lowered:
+                return normalized
+
+        return "Other"
+
+    @staticmethod
+    def _infer_sector_from_text(text: str) -> str:
+        lowered = (text or "").lower()
+        for sector, keywords in SECTOR_KEYWORDS_PRIORITY:
+            if any(keyword in lowered for keyword in keywords):
+                return sector
+        return "Other"
+
+    def _infer_sector(self, raw: RawOrganizationData) -> str:
+        haystack = " ".join(
+            part for part in [raw.sector_hint or "", raw.name or "", raw.raw_description or ""] if part
+        ).lower()
+        inferred = self._infer_sector_from_text(haystack)
+        if inferred != "Other":
+            return inferred
+        for alias, normalized in SECTOR_ALIASES.items():
+            if alias in haystack:
+                return normalized
+        return "Other"
+
+    def _build_direct_mission(self, raw: RawOrganizationData) -> str:
+        text = re.sub(r"\s+", " ", (raw.raw_description or "")).strip()
+        text = re.sub(
+            r"(?i)^[^\.]*appears in (?:public|curated) nonprofit listings[^\.]*\.?\s*",
+            "",
+            text,
+        )
+        if not text:
+            return f"{raw.name.strip() or 'This organization'} works on mission-driven nonprofit programs."
+
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        mission_parts: list[str] = []
+        for sentence in sentences:
+            s = sentence.strip(" -")
+            if len(s) < 30:
+                continue
+            mission_parts.append(s)
+            if len(mission_parts) == 2:
+                break
+
+        if not mission_parts:
+            snippet = text[:220].rstrip(" ,;:")
+            return f"{raw.name.strip() or 'This organization'} focuses on {snippet}."
+
+        mission = " ".join(mission_parts)
+        return mission[:1000]
+
+    def _build_specific_trigger(self, raw: RawOrganizationData, sector: str) -> str:
+        text = " ".join([raw.name or "", raw.raw_description or "", raw.website or ""]).lower()
+        signals: list[str] = []
+
+        if any(token in text for token in ("wildlife", "rescue", "rehabilitation", "sanctuary")):
+            signals.append("active wildlife rescue and rehabilitation focus")
+        if any(token in text for token in ("education", "training", "awareness", "workshop")):
+            signals.append("public education/awareness programming")
+        if any(token in text for token in ("donate", "fundraising", "sponsor", "support us")):
+            signals.append("clear fundraising and donor engagement signals")
+        if any(token in text for token in ("volunteer", "community", "outreach")):
+            signals.append("community and volunteer coordination needs")
+        if any(token in text for token in ("instagram", "facebook", "youtube", "threads", "linkedin")):
+            signals.append("high digital and social media visibility")
+        if any(token in text for token in ("program", "initiative", "services", "clinic", "project")):
+            signals.append("multiple active programs that benefit from operational tooling")
+
+        if not signals:
+            return (
+                f"The organization shows an active {sector.lower()} mission with public-facing programs; "
+                f"prioritize outreach with a concrete offer for CRM, donor tracking, and program operations."
+            )
+
+        top_signals = ", ".join(signals[:2])
+        return (
+            f"{top_signals} indicate immediate fit for solutions that improve donor management, "
+            f"program coordination, and impact reporting."
+        )[:800]
+
+    @staticmethod
+    def _is_generic_trigger(text: str) -> bool:
+        lowered = (text or "").lower()
+        generic_patterns = (
+            "appears in curated nonprofit listings",
+            "public presence signals",
+            "prioritize outreach to validate",
+            "partnership opportunities",
+        )
+        return any(pattern in lowered for pattern in generic_patterns)
+
+    @staticmethod
+    def _is_boilerplate_mission(text: str) -> bool:
+        lowered = (text or "").lower().strip()
+        boilerplate_starts = (
+            "appears in public nonprofit listings",
+            "according to available information",
+            "this organization appears",
+        )
+        return any(lowered.startswith(prefix) for prefix in boilerplate_starts)
 
     def _build_fallback_lead(self, raw: RawOrganizationData) -> QualifiedLead:
         name = raw.name.strip()[:300] if raw.name else "Unknown Organization"
@@ -195,20 +384,14 @@ class LeadQualifyingEngine:
         score = max(1, min(10, score))
         description = (raw.raw_description or "No description available").strip()
 
-        mission = (
-            f"{name} appears in public nonprofit listings and may be a viable outreach target. "
-            f"Source summary: {description[:220]}"
-        )
-
-        trigger = (
-            f"Organization appears in curated nonprofit listings and has public presence signals; "
-            f"prioritize outreach to validate active programs and partnership opportunities for {name}."
-        )
+        sector = self._infer_sector(raw)
+        mission = self._build_direct_mission(raw)
+        trigger = self._build_specific_trigger(raw, sector)
 
         return QualifiedLead(
             organization_name=name,
             mission_statement=mission[:1000],
-            target_sector="Other",
+            target_sector=sector,
             lead_score=score,
             outreach_trigger=trigger[:800],
             source_url=raw.source_url,
@@ -256,6 +439,17 @@ class LeadQualifyingEngine:
             try:
                 prompt = self._build_prompt(raw)
                 data = await self._call_gemini_with_retry(prompt)
+                normalized_sector = self.normalize_sector(data.get("target_sector"))
+                data["target_sector"] = normalized_sector if normalized_sector != "Other" else self._infer_sector(raw)
+
+                mission_statement = str(data.get("mission_statement", "")).strip()
+                if not mission_statement or self._is_boilerplate_mission(mission_statement):
+                    data["mission_statement"] = self._build_direct_mission(raw)
+
+                outreach_trigger = str(data.get("outreach_trigger", "")).strip()
+                if not outreach_trigger or self._is_generic_trigger(outreach_trigger):
+                    data["outreach_trigger"] = self._build_specific_trigger(raw, data["target_sector"])
+
                 data["source_url"] = raw.source_url
                 data["website"] = raw.website
                 return QualifiedLead(**data)
